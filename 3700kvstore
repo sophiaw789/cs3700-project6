@@ -15,32 +15,53 @@ sock.connect(my_id)
 
 last = 0
 
-def elect:
+election_timeout = random.choice(range(150, 301))
+
+database = {}
+
+status = {}
+status[my_id] = 'follower'
+for i in replica_ids:
+    status[i] = 'follower'
+
+def elect():
+    pass
 
 while True:
-    ready = select.select([sock], [], [], 0.1)[0]
+    sel = select.select([sock], [], [], 0.1)
+    ready = sel[0]
+    errs = sel[2]
 
     if sock in ready:
         msg_raw = sock.recv(32768)
-
+        
+        #?????????
         if len(msg_raw) == 0: continue
-            msg = json.loads(msg_raw)
+        msg = json.loads(msg_raw)
 
         # For now, ignore get() and put() from clients
         if msg['type'] in ['get', 'put']:
             resp = {"type": "redirect"}
-            sock.send(resp.encode())
+            sock.send(json.dumps(resp).encode())
 
         # Handle noop messages. This may be removed from your final implementation
         elif msg['type'] == 'noop':
             print '%s received a NOOP from %s' % (msg['dst'], msg['src'])
 
+        else:
+            resp = {'type': 'fail'}
+            sock.send(json.dumps(resp).encode())
+
         clock = time.time()
 
-        if clock-last > 2:
+        if clock - last > 2:
+            if len(errs) > 0 or :
+                elect()
             # Send a no-op message to a random peer every two seconds, just for fun
             # You definitely want to remove this from your implementation
-            msg = {'src': my_id, 'dst': random.choice(replica_ids), 'leader': 'FFFF', 'type': 'noop'}
-            sock.send(json.dumps(msg))
-            print '%s sending a NOOP to %s' % (msg['src'], msg['dst'])
+            
+            #msg = {'src': my_id, 'dst': random.choice(replica_ids), 'leader': 'FFFF', 'type': 'noop'}
+            #sock.send(json.dumps(msg))
+            #print '%s sending a NOOP to %s' % (msg['src'], msg['dst'])
+            
             last = clock
