@@ -1,0 +1,252 @@
+#!/usr/bin/env python
+import sys, socket, select, time, json, random, copy
+
+# Your ID number
+my_id = sys.argv[1]
+
+# The ID numbers of all the other replicas
+replica_ids = sys.argv[2:]
+
+# Connect to the network. All messages to/from other replicas and clients will
+# occur over this socket
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+sock.connect(my_id)
+
+SAVED_MGS = []
+MAJORITY = (len(replica_ids) + 1) // 2 + 1
+TIMEOUT = random.uniform(0.15, 0.3)
+CURR_ELECTION_TIME = time.time()
+FAIL_TIMEOUT = time.time()
+STORE = {}
+TERM = 0
+CURR_LEADER = 'FFFF'
+VOTED_FOR = None
+ALREADY_VOTED = set()
+HEARTBEAT = 0.08
+HEARTBEAT_TIMEOUT = time.time()
+
+def new_time():
+	return time.time()
+
+
+def reset_term(msg):
+	global TERM 
+	if msg['replica_term'] > TERM:
+		TERM = msg['replica_term']
+
+def request_vote():
+	global TERM
+	global CURR_ELECTION_TIME
+	global VOTED_FOR
+	global ALREADY_VOTED
+	global CURR_LEADER
+	
+	VOTED_FOR = None
+	CURR_LEADER = 'FFFF'
+	ALREADY_VOTED = set()
+
+	# if my_id not in VOTES:
+	ALREADY_VOTED.add(my_id)
+	CURR_ELECTION_TIME = new_time()
+	VOTED_FOR = my_id
+	TERM += 1
+	print(my_id + ' is requesting')
+	# for r in replica_ids:
+	data = {'src': my_id, 'dst': 'FFFF', 'leader': CURR_LEADER, 'replica_term': TERM, 'type': 'request_vote'}
+	sock.sendall(json.dumps(data).encode())
+	print('Term '+ str(TERM) + ' begins')
+
+
+def handle_get_msg(msg):
+	global CURR_LEADER
+	global STORE
+	global FAIL_TIMEOUT
+	global SAVED_MGS
+	if CURR_LEADER != 'FFFF':
+		if CURR_LEADER != my_id:
+			handle_redirect_msg(msg)
+		else:
+			value = STORE[msg['key']] if msg['key'] in STORE else ''
+			data =  {"src": my_id, 
+			"dst": msg['src'], 
+			"leader": CURR_LEADER, 
+			"type": "ok", 
+			"MID": msg['MID'], 
+			"value": value,
+			}
+			sock.sendall(json.dumps(data).encode())
+	else:
+		data = copy.deepcopy(msg)
+		data['timeout'] = FAIL_TIMEOUT
+		SAVED_MGS.append(data)
+
+
+# Handles fails message (key does not exist)
+# {"src": "<ID>", "dst": "<ID>", "leader": "<ID>", "type": "fail", "MID": "<a unique string>"}
+def handle_fail(msg):
+	global CURR_LEADER
+	data = {
+	"src": my_id, 
+	"dst": msg['src'], 
+	"leader": CURR_LEADER, 
+	"type": "fail", 
+	"MID": msg['MID'], 
+	}
+	sock.sendall(json.dumps(data).encode())
+
+
+# Redirect the message to the leader
+# {"src": "<ID>", "dst": "<ID>", "leader": "<ID>", "type": "redirect", "MID": "<a unique string>"}
+def handle_redirect_msg(msg):
+	global CURR_LEADER
+	data =  {"src": my_id, 
+	"dst": msg['src'], 
+	"leader": CURR_LEADER, 
+	"type": "redirect", 
+	"MID": msg['MID'],
+	}
+	
+	sock.sendall(json.dumps(data).encode())
+
+# req - {"src": "<ID>", "dst": "<ID>", "leader": "<ID>", "type": "put", "MID": "<a unique string>",
+# "key": "<some key>", "value": "<value of the key>"}
+# OK - {"src": "<ID>", "dst": "<ID>", "leader": "<ID>", "type": "ok", "MID": "<a unique string>"}
+# BAD - {"src": "<ID>", "dst": "<ID>", "leader": "<ID>", "type": "fail", "MID": "<a unique string>"}
+def handle_put_msg(msg):
+	global CURR_LEADER
+	global STORE
+	global SAVED_MGS
+	global FAIL_TIMEOUT
+	if CURR_LEADER != 'FFFF':
+		if CURR_LEADER != my_id:
+			handle_redirect_msg(msg)
+		else:
+			STORE[msg['key']] = msg['value']
+			
+			data =  {
+			"src": my_id, 
+			"dst": msg['src'], 
+			"leader": CURR_LEADER, 
+			"type": "ok", 
+			"MID": msg['MID'],
+			}
+			sock.sendall(json.dumps(data).encode())
+	else:
+		data = copy.deepcopy(msg)
+		data['timeout'] = FAIL_TIMEOUT
+		SAVED_MGS.append(data)
+
+
+# A replica sends back a "voting" message to indicate that it is voting
+# If a replica has voted this term, it cannot vote again
+def handle_request_vote_msg(msg):
+	global TERM
+	global CURR_LEADER
+	global CURR_ELECTION_TIME
+	global VOTED_FOR
+	# 1. Candidate of term #2 votes for Candidate of term #3 is ok
+	# 2. Follower of term #2 (leader term) votes for Candidate of term #2 is ok BUT should not vote for 
+	# another candidate of same term. BUT SHOULD VOTE FOR candidate of higher term
+	
+	if msg['replica_term'] > TERM:
+		VOTED_FOR = None
+		reset_term(msg)
+
+	# grant vote if not voted
+	if VOTED_FOR == None or VOTED_FOR == msg['src']:
+		data = {
+		'src': my_id,
+		'dst': msg['src'],
+		'leader': CURR_LEADER,
+		'replica_term': TERM,
+		'type': 'voting',
+		'vote': True,
+		}
+		VOTED_FOR = msg['src']
+		print('ID is '+ my_id + str(msg))
+		sock.sendall(json.dumps(data).encode())
+	CURR_ELECTION_TIME = new_time()
+	
+
+def handle_voting(msg):
+	global CURR_LEADER
+	global ALREADY_VOTED
+	global SAVED_MGS
+	global VOTED_FOR
+	global TERM
+	
+	# if some other replica's terms are higher than mine
+	if msg['replica_term'] > TERM:
+		VOTED_FOR = None
+		CURR_LEADER = 'FFFF'
+		ALREADY_VOTED = set()
+		reset_term(msg)
+
+	print('my id is ' + my_id +' ' + str(msg))
+	if msg['replica_term'] == TERM and CURR_LEADER != my_id and VOTED_FOR == my_id:
+		ALREADY_VOTED.add(msg['src'])
+		if len(ALREADY_VOTED) >= MAJORITY:
+			CURR_LEADER = my_id
+			print('leader is ' + CURR_LEADER)
+			send_saved_messages()
+			send_append_entry()
+
+
+def send_append_entry():
+	# for r in replica_ids:
+	data = {
+	'src': my_id,
+	'dst': 'FFFF',
+	'leader': CURR_LEADER,
+	'term': TERM,
+	'type': 'append_entry'
+	}
+	sock.sendall(json.dumps(data).encode())
+	HEARTBEAT_TIMEOUT = new_time()
+
+
+def handle_append_entry_msg(msg):
+	pass
+
+
+def send_messages(msg):
+	global SAVED_MGS
+	if (msg['type']  in ['get', 'put']) and CURR_LEADER == 'FFFF':
+		SAVED_MGS.append(msg)
+	elif msg['type'] == 'get':
+		handle_get_msg(msg)
+
+	elif msg['type'] == 'put':
+		handle_put_msg(msg)
+
+	elif msg['type'] == 'request_vote':
+		handle_request_vote_msg(msg) 
+
+	elif msg['type'] == 'voting':
+		handle_voting(msg) # leader keeps track of "voting" messages to know how many votes it has
+
+	elif msg['type'] == 'append_entry':
+		# handle_append_entry_msg(msg)
+		pass
+
+
+def send_saved_messages():
+	global SAVED_MGS
+	while len(SAVED_MGS) > 0:
+		send_messages(SAVED_MGS.pop(0))
+
+while True:
+	ready = select.select([sock], [], [], 0.1)[0]
+
+	if sock in ready:
+		msg_raw = sock.recv(32768)
+		if len(msg_raw) == 0: continue
+		msg = json.loads(msg_raw.decode())
+		send_messages(msg)
+
+	if new_time() - CURR_ELECTION_TIME > TIMEOUT and CURR_LEADER != my_id:
+		request_vote()
+	elif CURR_LEADER == my_id:
+		if new_time() - HEARTBEAT_TIMEOUT > HEARTBEAT:
+			send_append_entry()
+		

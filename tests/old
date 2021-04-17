@@ -1,0 +1,203 @@
+#!/usr/bin/env python
+
+import sys, socket, select, time, json, random, copy
+
+# Your ID number
+my_id = sys.argv[1]
+
+# The ID numbers of all the other replicas
+replica_ids = sys.argv[2:]
+
+# Connect to the network. All messages to/from other replicas and clients will
+# occur over this socket
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+sock.connect(my_id)
+
+timeout = time.time()
+
+heartbeat = 0.08
+heartbeat_timeout = time.time()
+
+elec_timeout = random.uniform(0.15, 0.3)
+elec_time = time.time()
+
+log = []
+queue = []
+database = {}
+leader = 'FFFF'
+term = 0
+commit = 0
+
+vote = None
+vote_log = set()
+
+major = ((len(replica_ids) + 1) // 2) + 1
+def get_time():
+    return time.time()
+
+def get_msg(msg):
+    global leader
+    global store
+    global timeout
+    global queue
+    if leader != 'FFFF':
+        if leader != my_id:
+            redirect_msg(msg)
+        else:
+            if msg['key'] in database:
+                value = database[msg['key']]
+            else:
+                value = ''
+            data = {'src': my_id, 'dst': msg['src'], 'leader': leader, 'type': 'ok',
+            'MID': msg['MID'],
+            'value': value}
+            sock.sendall(json.dumps(data).encode())
+    else:
+        copy_msg = copy.deepcopy(msg)
+        copy_msg['timeout'] = timeout
+        queue.append(copy_msg)
+
+def redirect_msg(msg):
+    global leader
+    data = {'src': my_id, 'dst': msg['src'], 'leader': leader, 'type': 'redirect', 'MID': msg['MID']}
+    sock.sendall(json.dumps(data).encode())
+
+def put_msg(msg):
+    global leader, database, queue, log, timeout
+    if leader != 'FFFF':
+        if leader != my_id:
+            redirect_msg(msg)
+        else:
+            database[msg['key']] = msg['value']
+            data = {'src': my_id, 'dst': msg['src'], 'leader': leader, 'type': 'ok', 'MID': msg['MID']}
+            sock.sendall(json.dumps(data).encode())
+            log.append({'leader': leader, 'term': term, 'msg': msg})
+    else:
+        copy_msg = copy.deepcopy(msg)
+        copy_msg['timeout'] = timeout
+        queue.append(copy_msg)
+
+def election_msg(msg):
+    global term, leader, elec_time, vote
+
+    if msg['replica_term'] > term:
+        vote = None
+        change_term(msg)
+
+    if vote == None or vote == msg['src']:
+        data = {'src': my_id, 'dst': msg['src'], 'leader': leader, 'replica_term': term,
+        'type': 'votes',
+        'vote': True}
+        vote = msg['src']
+        print('In election_msg, ID is '+ my_id + str(msg))
+        sock.sendall(json.dumps(data).encode())
+    elec_time = get_time()
+
+def voting_msg(msg):
+    global leader, vote_log, queue, vote, term
+    
+    if msg['replica_term'] > term:
+        vote = None
+        leader = 'FFFF'
+        vote_log = set()
+        change_term(msg)
+
+        print('In voting_msg, my id is ' + my_id +' ' + str(msg))
+    if msg['replica_term'] == term and leader != my_id and vote == my_id:
+        vote_log.add(msg['src'])
+        if len(vote_log) >= major:
+            leader = my_id
+            print('In voting_msg, leader is ' + CURR_LEADER)
+            send_saved_messages()
+            # maybe add send_append_entries
+            send_heartbeat()
+
+def send_msg(msg):
+    global log
+    # leader is unknown
+    if (msg['type'] in ['get', 'put']) and leader == 'FFFF':
+        log.append(msg)
+    elif msg['type'] == 'get':
+        get_msg(msg)
+    elif msg['type'] == 'put':
+        put_msg(msg)
+    elif msg['type'] == 'election':
+        election_msg(msg)
+    elif msg['type'] == 'votes':
+        voting_msg(msg)
+    elif msg['type'] == 'append_entry':
+        append_entry_msg(msg)
+    elif msg['type'] == 'fail':
+        fail_msg(msg)
+
+def fail_msg(msg):
+    global leader
+    data = {'src': my_id, 'dst': msg['src'], 'leader': leader, 'type': 'fail', 'MID': msg['MID']}
+    sock.sendall(json.dumps(data).encode())
+
+def change_term(msg):
+    global term
+    if msg['replica_term'] > term:
+        term = msg['replica_term']
+
+def elect():
+    global term, elec_time, vote, vote_log, leader
+
+    vote = None
+    leader = 'FFFF'
+    vote_log = set()
+
+    vote_log.add(my_id)
+    elec_time = get_time()
+    vote = my_id
+    term += 1
+    print(my_id + ' is requesting in elect()')
+        # for r in replica_ids:
+    data = {'src': my_id, 'dst': 'FFFF', 'leader': leader, 'replica_term': term, 'type': 'election'}
+    sock.sendall(json.dumps(data).encode())
+    print('Term '+ str(term) + ' begins')
+
+def send_heartbeat():
+    msg = {'src': my_id, 'dst': 'FFFF', 'leader': leader, 'term': term, 'type': 'append_entry'}
+    sock.sendall(json.dumps(data).encode())
+    heartbeat_timeout = get_time()
+
+while True:
+    ready = select.select([sock], [], [], 0.1)[0]
+
+    if sock in ready:
+        msg_raw = sock.recv(32768)
+        
+        if len(msg_raw) == 0: continue
+        msg = json.loads(msg_raw.decode())
+        send_msg(msg)
+
+        # For now, ignore get() and put() from clients
+        #if msg['type'] in ['get', 'put']:
+        #    resp = {"type": "redirect"}
+        #    sock.send(json.dumps(resp).encode())
+
+        # Handle noop messages. This may be removed from your final implementation
+        #elif msg['type'] == 'noop':
+        #    print '%s received a NOOP from %s' % (msg['dst'], msg['src'])
+
+        #else:
+        #    resp = {'type': 'fail'}
+        #    sock.send(json.dumps(resp).encode())
+
+        #clock = time.time()
+
+    if get_time() - elec_timeout > elec_timeout and leader != my_id: 
+            elect()
+    elif leader == my_id:
+        if get_time() - heartbeat_timeout > heartbeat:
+            send_heartbeat()
+
+            # Send a no-op message to a random peer every two seconds, just for fun
+            # You definitely want to remove this from your implementation
+            
+            #msg = {'src': my_id, 'dst': random.choice(replica_ids), 'leader': 'FFFF', 'type': 'noop'}
+            #sock.send(json.dumps(msg))
+            #print '%s sending a NOOP to %s' % (msg['src'], msg['dst'])
+            
+            #last = clock
